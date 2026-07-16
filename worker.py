@@ -50,6 +50,8 @@ async def _process_with_retry(task_id: str, file_path: Path) -> dict:
         return sizes
     except FileNotFoundError as e:
         raise PermanentError(f"Fayl topilmadi: {e}") from e
+    except ConnectionError as e:
+        raise TransientError(f"Ulanish uzildi: {e}") from e
     except (UnidentifiedImageError, OSError) as e:
         raise PermanentError(f"Rasm buzuq: {e}") from e
     except Exception as e:
