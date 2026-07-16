@@ -9,6 +9,7 @@ from sqlalchemy import select
 from session import AsyncSessionLocal
 from models import Task
 from config import settings
+import signal
 
 
 from tenacity import (
@@ -19,10 +20,16 @@ from queues import setup_queues
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
-
+shutdown_event = asyncio.Event()
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
+
+
+def _handle_signal():
+    logger.info("To'xtash signali keldi, joriy ishni tugatib to'xtaymiz...")
+    shutdown_event.set()
+
 
 SIZES = {
     "thumb": 150,
@@ -90,8 +97,12 @@ async def handle_task(payload: dict):
         if task is None:
             logger.warning(f"[topilmadi] {task_id}")
             return
+        if task.status == "done":
+            logger.info(f"[o'tkazildi: allaqachon done] {task_id}")
+            return
         task.status = "processing"
         await db.commit()
+
     sizes = await _process_with_retry(task_id, file_path)
 
     async with AsyncSessionLocal() as db:
@@ -133,11 +144,29 @@ async def publish_to(channel, exchange_name, routing_key, body, retry_count):
     await exchange.publish(message, routing_key=routing_key)
 
 
+_shutdown = False
+
+def _handle_signal(signum, frame):
+    global _shutdown
+    logger.info("To'xtash signali keldi, joriy ishni tugatib to'xtaymiz...")
+    _shutdown = True
+
+
 async def main():
     connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)
     channel = await connection.channel()
     await channel.set_qos(prefetch_count=1)
     queue = await setup_queues(channel)
+
+    # loop = asyncio.get_running_loop()
+    # for sig in (signal.SIGINT, signal.SIGTERM):
+    #     loop.add_signal_handler(sig, _handle_signal)
+    
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+
     logger.info("Worker ishga tushdi...")
 
     async with queue.iterator() as messages:
@@ -166,6 +195,9 @@ async def main():
                     await mark_failed(task_id, str(e)) 
                     logger.error(f"[DLQ: {settings.MAX_RETRIES} urinish tugadi] {e}")
                     await publish_to(channel, settings.DLQ_EXCHANGE, settings.QUEUE_NAME, message.body, retry_count)
+            if _shutdown:
+                logger.info("Joriy ish tugadi, worker to'xtayapti.")
+                break
                     
 
 if __name__ == "__main__":
