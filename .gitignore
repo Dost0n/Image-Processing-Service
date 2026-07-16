@@ -1,0 +1,25 @@
+
+# Virtual muhit
+venv/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Ma'lumotlar bazasi (test ma'lumotlari GitHub'ga kerak emas)
+*.db
+tasks.db
+
+# pytest
+.pytest_cache/
+.coverage
+
+# IDE
+.vscode/
+.idea/
+
+# Muhit o'zgaruvchilari (maxfiy ma'lumotlar)
+.env

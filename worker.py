@@ -1,0 +1,175 @@
+# worker.py
+import asyncio
+import json
+import logging
+from pathlib import Path
+import aio_pika
+from PIL import Image, UnidentifiedImageError
+from sqlalchemy import select
+from session import AsyncSessionLocal
+from models import Task
+
+from tenacity import (
+    retry, stop_after_attempt, wait_exponential,
+    retry_if_exception_type, RetryError
+)
+from queues import setup_queues, QUEUE_NAME, MAIN_EXCHANGE, RETRY_EXCHANGE, DLQ_EXCHANGE, MAX_RETRIES
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+
+RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
+RETRY_TTL = 5000
+
+SIZES = {
+    "thumb": 150,
+    "medium": 600,
+    "large": 1200,
+}
+
+class TransientError(Exception):
+    """Vaqtinchalik xato — qayta urinsa bo'ladi."""
+
+
+class PermanentError(Exception):
+    """Doimiy — darhol DLQ, retry behuda."""
+
+# @retry(
+#     stop=stop_after_attempt(3),
+#     wait=wait_exponential(multiplier=1, min=1, max=6),
+#     retry=retry_if_exception_type(TransientError), 
+#     reraise=True,
+# )
+async def _process_with_retry(task_id: str, file_path: Path) -> dict:
+    loop = asyncio.get_running_loop()
+    try:
+        sizes = await loop.run_in_executor(None, process_image, file_path)
+        return sizes
+    except FileNotFoundError as e:
+        raise PermanentError(f"Fayl topilmadi: {e}") from e
+    except (UnidentifiedImageError, OSError) as e:
+        raise PermanentError(f"Rasm buzuq: {e}") from e
+    except Exception as e:
+        raise TransientError(str(e)) from e
+    
+
+def process_image(file_path: Path) -> dict:
+    results = {}
+    with Image.open(file_path) as img:
+        if img.mode in ("RGBA", "LA", "P"):
+            background = Image.new("RGB", img.size, (255, 255, 255))
+
+            rgb_img = img.convert("RGBA")
+            background.paste(rgb_img, mask=rgb_img.split()[-1])
+            img = background
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        for name, width in SIZES.items():
+            resized = img.copy()
+            resized.thumbnail((width, width), Image.Resampling.LANCZOS)
+            output_file = UPLOAD_DIR / f"{file_path.stem}_{name}.jpg"
+            resized.save(output_file, format="JPEG", quality=90, optimize=True)
+            results[name] = str(output_file)
+    return results
+
+
+async def handle_task(payload: dict):
+    task_id = payload["task_id"]
+    file_path = Path(payload["file_path"])
+    logger.info(f"[boshlandi] {task_id}")
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Task).where(Task.task_id == task_id))
+        task = result.scalar_one_or_none()
+        if task is None:
+            logger.warning(f"[topilmadi] {task_id}")
+            return
+        task.status = "processing"
+        await db.commit()
+    sizes = await _process_with_retry(task_id, file_path)
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Task).where(Task.task_id == task_id))
+        task = result.scalar_one_or_none()
+        task.status = "done"
+        task.sizes = sizes
+        await db.commit()
+
+    logger.info(f"[tayyor] {task_id}")
+
+
+async def mark_failed(task_id: str, error: str):
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Task).where(Task.task_id == task_id))
+        task = result.scalar_one_or_none()
+        if task:
+            task.status = "failed"
+            task.error = error
+            await db.commit()
+
+
+async def mark_status(task_id: str, status: str):
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Task).where(Task.task_id == task_id))
+        task = result.scalar_one_or_none()
+        if task:
+            task.status = status
+            await db.commit()
+
+
+async def publish_to(channel, exchange_name, routing_key, body, retry_count):
+    exchange = await channel.get_exchange(exchange_name)
+    message = aio_pika.Message(
+        body=body,
+        delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+        headers={"x-retry-count": retry_count},
+    )
+    await exchange.publish(message, routing_key=routing_key)
+
+
+async def main():
+    connection = await aio_pika.connect_robust(RABBITMQ_URL)
+    channel = await connection.channel()
+    await channel.set_qos(prefetch_count=1)
+    queue = await setup_queues(channel)
+    logger.info("Worker ishga tushdi...")
+
+    async with queue.iterator() as messages:
+        async for message in messages:
+            retry_count = message.headers.get("x-retry-count", 0) if message.headers else 0
+            payload = json.loads(message.body.decode())
+            task_id = payload["task_id"]
+            try:
+                payload = json.loads(message.body.decode())
+                await handle_task(payload)
+                await message.ack()
+
+            except PermanentError as e:
+                await message.ack()
+                await mark_failed(task_id, str(e)) 
+                logger.error(f"[DLQ: doimiy xato, retry yo'q] {e}")
+                await publish_to(channel, DLQ_EXCHANGE, QUEUE_NAME, message.body, retry_count)
+
+            except Exception as e:
+                await message.ack()
+                if retry_count < MAX_RETRIES:
+                    await mark_status(task_id, "retrying") 
+                    logger.warning(f"[retry {retry_count + 1}/{MAX_RETRIES}] {e}")
+                    await publish_to(channel, RETRY_EXCHANGE, QUEUE_NAME, message.body, retry_count + 1)
+                else:
+                    await mark_failed(task_id, str(e)) 
+                    logger.error(f"[DLQ: {MAX_RETRIES} urinish tugadi] {e}")
+                    await publish_to(channel, DLQ_EXCHANGE, QUEUE_NAME, message.body, retry_count)
+                    
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+
