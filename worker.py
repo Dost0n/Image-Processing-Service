@@ -8,12 +8,14 @@ from PIL import Image, UnidentifiedImageError
 from sqlalchemy import select
 from session import AsyncSessionLocal
 from models import Task
+from config import settings
+
 
 from tenacity import (
     retry, stop_after_attempt, wait_exponential,
     retry_if_exception_type, RetryError
 )
-from queues import setup_queues, QUEUE_NAME, MAIN_EXCHANGE, RETRY_EXCHANGE, DLQ_EXCHANGE, MAX_RETRIES
+from queues import setup_queues
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -21,10 +23,6 @@ logger = logging.getLogger(__name__)
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
-
-
-RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
-RETRY_TTL = 5000
 
 SIZES = {
     "thumb": 150,
@@ -134,7 +132,7 @@ async def publish_to(channel, exchange_name, routing_key, body, retry_count):
 
 
 async def main():
-    connection = await aio_pika.connect_robust(RABBITMQ_URL)
+    connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)
     channel = await connection.channel()
     await channel.set_qos(prefetch_count=1)
     queue = await setup_queues(channel)
@@ -154,18 +152,18 @@ async def main():
                 await message.ack()
                 await mark_failed(task_id, str(e)) 
                 logger.error(f"[DLQ: doimiy xato, retry yo'q] {e}")
-                await publish_to(channel, DLQ_EXCHANGE, QUEUE_NAME, message.body, retry_count)
+                await publish_to(channel, settings.DLQ_EXCHANGE, settings.QUEUE_NAME, message.body, retry_count)
 
             except Exception as e:
                 await message.ack()
-                if retry_count < MAX_RETRIES:
+                if retry_count < settings.MAX_RETRIES:
                     await mark_status(task_id, "retrying") 
-                    logger.warning(f"[retry {retry_count + 1}/{MAX_RETRIES}] {e}")
-                    await publish_to(channel, RETRY_EXCHANGE, QUEUE_NAME, message.body, retry_count + 1)
+                    logger.warning(f"[retry {retry_count + 1}/{settings.MAX_RETRIES}] {e}")
+                    await publish_to(channel, settings.RETRY_EXCHANGE, settings.QUEUE_NAME, message.body, retry_count + 1)
                 else:
                     await mark_failed(task_id, str(e)) 
-                    logger.error(f"[DLQ: {MAX_RETRIES} urinish tugadi] {e}")
-                    await publish_to(channel, DLQ_EXCHANGE, QUEUE_NAME, message.body, retry_count)
+                    logger.error(f"[DLQ: {settings.MAX_RETRIES} urinish tugadi] {e}")
+                    await publish_to(channel, settings.DLQ_EXCHANGE, settings.QUEUE_NAME, message.body, retry_count)
                     
 
 if __name__ == "__main__":

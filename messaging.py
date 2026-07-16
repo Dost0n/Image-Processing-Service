@@ -1,9 +1,9 @@
 import json
 import aio_pika
 from aio_pika import Message, DeliveryMode
-from queues import setup_queues, QUEUE_NAME,  MAIN_EXCHANGE
+from queues import setup_queues
+from config import settings
 
-RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
 
 _connection = None
 _channel = None
@@ -11,7 +11,7 @@ _channel = None
 
 async def connect():
     global _connection, _channel
-    _connection = await aio_pika.connect_robust(RABBITMQ_URL)
+    _connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)
     _channel = await _connection.channel()
     await setup_queues(_channel)
 
@@ -23,8 +23,8 @@ async def publish_task(task_id: str, file_path: str):
         delivery_mode=DeliveryMode.PERSISTENT,
         headers={"x-retry-count": 0},
     )
-    exchange = await _channel.get_exchange(MAIN_EXCHANGE)
-    await exchange.publish(message, routing_key=QUEUE_NAME)
+    exchange = await _channel.get_exchange(settings.MAIN_EXCHANGE)
+    await exchange.publish(message, routing_key=settings.QUEUE_NAME)
 
 
 async def close():
